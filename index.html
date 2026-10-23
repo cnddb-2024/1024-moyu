@@ -1,0 +1,1051 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>还有1024秒下班</title>
+<style>
+  html,body{margin:0;padding:0;height:100%;background:#0b0e14;overflow:hidden;touch-action:none;-webkit-user-select:none;user-select:none;}
+  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:radial-gradient(ellipse at 50% 30%, #131a28 0%, #0b0e14 70%);}
+  canvas{display:block;border-radius:6px;box-shadow:0 0 60px rgba(60,140,255,.15), 0 0 0 1px #1d2736;}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game" width="1280" height="800"></canvas></div>
+<script>
+'use strict';
+
+const CONFIG = {
+  totalTime: 1024,
+  naturalDrain: 1,
+  stages: [
+    { minRemain: 256, mult: 8, watchChance: 0.30, watchMin: 1.6, watchMax: 2.6, label: 'x8' },
+    { minRemain: 64,  mult: 4, watchChance: 0.45, watchMin: 2.2, watchMax: 3.6, label: 'x4' },
+    { minRemain: 0,   mult: 2, watchChance: 0.70, watchMin: 3.2, watchMax: 5.0, label: 'x2' },
+  ],
+  boss: { walkSpeed: 95, pauseMin: 0.5, pauseMax: 1.3, turnTime: 0.28 },
+  reactionWindow: 0.5,
+  caughtPenalty: 32,
+  caughtStun: 3,
+  maxSuspicion: 3,
+  stage3Edge: 64,
+  bossRange: { left: 110, right: 1170 },
+  bonusFloatEvery: 0.45,
+  rating: { S: 0, A: 1, B: 2 },
+  ratingBonus: { S: 560, A: 380 },
+  scoldLines: ['又在摸鱼?!','那条鱼很好玩吗?!','工作量呢?!','信不信加班到天亮!','盯——你完了','1010！扣绩效！'],
+  milestoneLines: { 512: '512！过半啦！', 256: '256！冲！', 128: '128！', 64: '64！最后冲刺！', 32: '32！', 16: '16！', 8: '8！', 4: '4！', 2: '2！马上！' },
+};
+
+const W = 1280, H = 800;
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+const GAME = {
+  scene: 'TITLE',
+  time: 0,
+  remain: CONFIG.totalTime,
+  bonus: 0,
+  suspicion: 0,
+  caughtCount: 0,
+  stunned: 0,
+  shakeT: 0,
+  flashT: 0,
+  scoldT: 0,
+  scoldText: '',
+  milestone: 1024,
+  milestoneToastT: 0,
+  milestoneToastText: '',
+  lastMilestoneHit: null,
+};
+
+const BOSS = {
+  x: 300,
+  dir: 1,
+  state: 'walk',
+  timer: 1,
+  facing: 'side',
+  watchElapsedHold: 0,
+  side: 1,
+};
+
+const PLAYER = {
+  holding: false,
+  rubPhase: 0,
+  holdTime: 0,
+  floatTimer: 0,
+};
+
+const FX = {
+  floats: [],
+  fireworks: [],
+  sparks: [],
+  fireworkTimer: 0,
+};
+
+const VIEW = { scale: 1, ox: 0, oy: 0 };
+
+function fitCanvas() {
+  const pad = 16;
+  const s = Math.min((window.innerWidth - pad) / W, (window.innerHeight - pad) / H);
+  VIEW.scale = s;
+  canvas.style.width = (W * s) + 'px';
+  canvas.style.height = (H * s) + 'px';
+}
+window.addEventListener('resize', fitCanvas);
+fitCanvas();
+
+function toGameXY(clientX, clientY) {
+  const r = canvas.getBoundingClientRect();
+  return { x: (clientX - r.left) / VIEW.scale, y: (clientY - r.top) / VIEW.scale };
+}
+
+function currentStage() {
+  for (const st of CONFIG.stages) if (GAME.remain > st.minRemain) return st;
+  return CONFIG.stages[CONFIG.stages.length - 1];
+}
+
+function resetGame() {
+  GAME.time = 0;
+  GAME.remain = CONFIG.totalTime;
+  GAME.bonus = 0;
+  GAME.suspicion = 0;
+  GAME.caughtCount = 0;
+  GAME.stunned = 0;
+  GAME.shakeT = 0;
+  GAME.flashT = 0;
+  GAME.scoldT = 0;
+  GAME.scoldText = '';
+  GAME.milestone = 1024;
+  GAME.milestoneToastT = 0;
+  GAME.lastMilestoneHit = null;
+  BOSS.x = 300;
+  BOSS.dir = 1;
+  BOSS.state = 'walk';
+  BOSS.timer = 1;
+  BOSS.facing = 'side';
+  BOSS.watchElapsedHold = 0;
+  PLAYER.holding = false;
+  PLAYER.rubPhase = 0;
+  PLAYER.holdTime = 0;
+  PLAYER.floatTimer = 0;
+  FX.floats = [];
+  FX.fireworks = [];
+  FX.sparks = [];
+  FX.fireworkTimer = 0;
+}
+
+function startGame() {
+  resetGame();
+  GAME.scene = 'PLAYING';
+  audioStart();
+}
+
+function addFloat(x, y, text, color, size) {
+  FX.floats.push({ x, y, text, color: color || '#8fd3ff', size: size || 22, life: 1.1, vy: -46 });
+}
+
+function addShake(t) { GAME.shakeT = Math.max(GAME.shakeT, t); }
+
+function bossWatching() {
+  return BOSS.facing === 'front' && GAME.scene === 'PLAYING';
+}
+
+function canMoyu() {
+  return GAME.scene === 'PLAYING' && GAME.stunned <= 0 && !bossWatching();
+}
+
+function updatePlaying(dt) {
+  GAME.time += dt;
+  if (GAME.stunned > 0) GAME.stunned -= dt;
+  if (GAME.scoldT > 0) GAME.scoldT -= dt;
+  if (GAME.flashT > 0) GAME.flashT -= dt;
+  if (GAME.shakeT > 0) GAME.shakeT -= dt;
+  if (GAME.milestoneToastT > 0) GAME.milestoneToastT -= dt;
+  if (GAME.cdPulse > 0) GAME.cdPulse = Math.max(0, GAME.cdPulse - dt * 4);
+
+  const holding = PLAYER.holding && GAME.stunned <= 0;
+  if (holding) {
+    PLAYER.holdTime += dt;
+    PLAYER.rubPhase += dt * 13;
+    if (canMoyu()) {
+      const st = currentStage();
+      const gained = (st.mult - CONFIG.naturalDrain) * dt;
+      GAME.remain = Math.max(0, GAME.remain - gained);
+      GAME.bonus += gained;
+      PLAYER.floatTimer += dt;
+      if (PLAYER.floatTimer >= CONFIG.bonusFloatEvery) {
+        PLAYER.floatTimer = 0;
+        const n = Math.round(st.mult * CONFIG.bonusFloatEvery);
+        addFloat(FISH.x + rnd(-20, 20), FISH.y - 60, '+' + n, '#7CFC9A', 22);
+        audioRub();
+      }
+    }
+  } else {
+    PLAYER.holdTime = 0;
+    PLAYER.rubPhase += dt * 1.2;
+    PLAYER.floatTimer = CONFIG.bonusFloatEvery;
+  }
+
+  GAME.remain = Math.max(0, GAME.remain - CONFIG.naturalDrain * dt);
+
+  updateBoss(dt);
+  updateMilestones();
+  updateFloats(dt);
+
+  if (GAME.remain <= 0) {
+    GAME.scene = 'WIN';
+    audioWin();
+  }
+  if (GAME.suspicion >= CONFIG.maxSuspicion) {
+    GAME.scene = 'LOSE';
+  }
+}
+
+function updateMilestones() {
+  const r = Math.ceil(GAME.remain);
+  const m = CONFIG.milestoneLines;
+  if (r !== GAME.lastMilestoneHit && m[r]) {
+    GAME.lastMilestoneHit = r;
+    GAME.milestoneToastT = 1.6;
+    GAME.milestoneToastText = m[r];
+    audioPop();
+  }
+}
+
+function updateFloats(dt) {
+  for (let i = FX.floats.length - 1; i >= 0; i--) {
+    const f = FX.floats[i];
+    f.life -= dt;
+    f.y += f.vy * dt;
+    f.vy *= 0.96;
+    if (f.life <= 0) FX.floats.splice(i, 1);
+  }
+}
+
+function updateFX(dt) {
+  for (let i = FX.fireworks.length - 1; i >= 0; i--) {
+    const p = FX.fireworks[i];
+    p.life -= dt;
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.vy += 220 * dt;
+    p.vx *= 0.985;
+    p.vy *= 0.985;
+    if (p.life <= 0) FX.fireworks.splice(i, 1);
+  }
+  for (let i = FX.sparks.length - 1; i >= 0; i--) {
+    const s = FX.sparks[i];
+    s.life -= dt;
+    s.x += s.vx * dt;
+    s.y += s.vy * dt;
+    s.vy += 60 * dt;
+    if (s.life <= 0) FX.sparks.splice(i, 1);
+  }
+}
+
+let lastTS = 0;
+function loop(ts) {
+  const dt = Math.min(0.05, (ts - lastTS) / 1000 || 0.016);
+  lastTS = ts;
+  GAME.scene === 'PLAYING' ? updatePlaying(dt) : updateFX(dt);
+  if (GAME.scene === 'WIN') {
+    FX.fireworkTimer -= dt;
+    if (FX.fireworkTimer <= 0) {
+      FX.fireworkTimer = rnd(0.25, 0.7);
+      spawnFirework(rnd(150, W - 150), rnd(80, 380));
+    }
+  }
+  render(dt);
+  requestAnimationFrame(loop);
+}
+
+const FISH = { x: 935, y: 628 };
+const UI = { muteRect: null, startRect: null, againRect: null, retryRect: null };
+
+const CODE_LINES = [
+  'while(true){ work(); }',
+  'git push --force origin main',
+  'if(bug) { bug.fix(); }',
+  'console.log("wtf", wtf)',
+  'sudo rm -rf / doubts',
+  'let deadline = yesterday;',
+  'deploy(friday, 18:00);',
+  'TODO: fix everything',
+  'npm install more-coffee',
+  'return 1024; // fish',
+  'try { sleep(); } catch(e){}',
+  'this.sprint += 1;',
+];
+let codeScroll = 0;
+
+function render(dt) {
+  ctx.save();
+  ctx.clearRect(0, 0, W, H);
+  if (GAME.shakeT > 0) {
+    const s = Math.min(1, GAME.shakeT / 0.5);
+    ctx.translate(rnd(-1, 1) * 9 * s, rnd(-1, 1) * 7 * s);
+  }
+  drawRoom();
+  drawBoss();
+  drawDesk();
+  drawPlayer();
+  drawFish();
+  if (PLAYER.holding && GAME.stunned <= 0) drawHand();
+  drawScoldBubble();
+  drawFloatsLayer();
+  drawHUD();
+  drawOverlays(dt);
+  ctx.restore();
+}
+
+function drawRoom() {
+  const wallTop = 128;
+  const g = ctx.createLinearGradient(0, wallTop, 0, 520);
+  g.addColorStop(0, '#141b2b');
+  g.addColorStop(1, '#0f1522');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, wallTop, W, 520 - wallTop);
+  ctx.fillStyle = '#1a2334';
+  ctx.fillRect(0, 0, W, wallTop);
+  ctx.fillStyle = '#0d1220';
+  ctx.fillRect(0, 470, W, 110);
+  ctx.fillStyle = '#101828';
+  for (let i = 0; i < W; i += 64) ctx.fillRect(i, 470, 2, 110);
+
+  ctx.fillStyle = '#3fa7ff';
+  ctx.fillRect(0, wallTop, W, 4);
+  ctx.font = 'bold 30px "PingFang SC","Microsoft YaHei",sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#3fa7ff';
+  ctx.fillText('★ 1024 程序员节快乐 ★', W / 2, 172);
+  ctx.font = '14px monospace';
+  ctx.fillStyle = 'rgba(143,211,255,0.45)';
+  ctx.fillText('0110100001101001 0110100001101001 0110100001101001', W / 2, 202);
+
+  drawWallScreen(250, 236, 420, 150);
+  drawWallScreen(1030, 236, 420, 150);
+
+  ctx.fillStyle = '#232f45';
+  ctx.fillRect(150, 250, 60, 60);
+  ctx.strokeStyle = '#3fa7ff';
+  ctx.lineWidth = 3;
+  ctx.strokeRect(150, 250, 60, 60);
+  ctx.fillStyle = '#8fd3ff';
+  ctx.font = 'bold 15px monospace';
+  ctx.fillText('NO', 180, 270);
+  ctx.fillText('BUG', 180, 290);
+  ctx.strokeStyle = '#ff5a5a';
+  ctx.lineWidth = 4;
+  ctx.beginPath();
+  ctx.moveTo(158, 256);
+  ctx.lineTo(202, 304);
+  ctx.stroke();
+
+  ctx.fillStyle = '#2a3545';
+  ctx.beginPath();
+  ctx.arc(640, 246, 26, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = '#8fd3ff';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(640, 246);
+  ctx.lineTo(640, 230);
+  ctx.moveTo(640, 246);
+  ctx.lineTo(650, 250);
+  ctx.stroke();
+}
+
+function drawWallScreen(x, y, w, h) {
+  ctx.fillStyle = '#05070c';
+  ctx.fillRect(x, y, w, h);
+  ctx.strokeStyle = '#1d2736';
+  ctx.lineWidth = 4;
+  ctx.strokeRect(x - 2, y - 2, w + 4, h + 4);
+  codeScroll += 0.18;
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(x + 6, y + 6, w - 12, h - 12);
+  ctx.clip();
+  ctx.font = '13px monospace';
+  ctx.textAlign = 'left';
+  const rowH = 17;
+  const idx = Math.floor(codeScroll / rowH);
+  for (let i = 0; i < 10; i++) {
+    const line = CODE_LINES[(idx + i) % CODE_LINES.length];
+    const ly = y + 14 + i * rowH - (codeScroll % rowH);
+    ctx.fillStyle = i % 3 === 0 ? '#7CFC9A' : '#5b87b8';
+    ctx.fillText(line, x + 12, ly);
+  }
+  ctx.restore();
+  ctx.textAlign = 'center';
+}
+
+function drawDesk() {
+  ctx.fillStyle = '#2c2317';
+  ctx.fillRect(80, 560, 1120, 26);
+  ctx.fillStyle = '#3a2e1e';
+  ctx.fillRect(80, 586, 1120, 18);
+  ctx.fillStyle = '#241c12';
+  ctx.fillRect(140, 604, 26, 196);
+  ctx.fillRect(1114, 604, 26, 196);
+
+  ctx.fillStyle = '#151b28';
+  ctx.fillRect(470, 470, 220, 68);
+  ctx.strokeStyle = '#0d1220';
+  ctx.lineWidth = 5;
+  ctx.strokeRect(470, 470, 220, 68);
+  ctx.fillStyle = '#0d1220';
+  ctx.fillRect(566, 538, 28, 22);
+
+  ctx.fillStyle = '#1c2534';
+  ctx.fillRect(380, 540, 400, 14);
+  ctx.fillStyle = '#2a3548';
+  for (let i = 0; i < 12; i++) ctx.fillRect(396 + i * 31, 543, 22, 8);
+
+  ctx.fillStyle = '#7a4a21';
+  ctx.fillRect(828, 536, 34, 24);
+  ctx.fillStyle = '#d8e6f5';
+  ctx.fillRect(832, 538, 26, 3);
+  ctx.strokeStyle = 'rgba(216,230,245,0.35)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(845, 530);
+  ctx.quadraticCurveTo(852, 520, 845, 512);
+  ctx.stroke();
+
+  ctx.fillStyle = '#264a3a';
+  ctx.fillRect(292, 528, 10, 32);
+  ctx.fillStyle = '#3f8f5f';
+  ctx.beginPath();
+  ctx.ellipse(297, 520, 26, 16, 0, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+function drawPlayer() {
+  const bob = Math.sin(GAME.time * 1.6) * 2;
+  const px = 580, py = 690 + bob;
+  ctx.fillStyle = '#161d2c';
+  ctx.beginPath();
+  ctx.ellipse(px, 742, 120, 34, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#222b3d';
+  ctx.beginPath();
+  ctx.moveTo(px - 108, 760);
+  ctx.lineTo(px - 84, 596);
+  ctx.lineTo(px + 84, 596);
+  ctx.lineTo(px + 108, 760);
+  ctx.closePath();
+  ctx.fill();
+  ctx.fillStyle = '#2d3a52';
+  ctx.beginPath();
+  ctx.ellipse(px, py - 60, 96, 66, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#3a4963';
+  ctx.beginPath();
+  ctx.arc(px, py - 148, 40, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#151b28';
+  ctx.beginPath();
+  ctx.arc(px, py - 152, 38, Math.PI, Math.PI * 2);
+  ctx.fill();
+  ctx.fillRect(px - 38, py - 152, 76, 16);
+  ctx.strokeStyle = '#3fa7ff';
+  ctx.lineWidth = 6;
+  ctx.beginPath();
+  ctx.arc(px, py - 152, 44, Math.PI * 1.08, Math.PI * 1.92);
+  ctx.stroke();
+  ctx.fillStyle = 'rgba(63,167,255,0.10)';
+  ctx.beginPath();
+  ctx.ellipse(px, py - 40, 130, 90, 0, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+function drawBoss() {
+  const bx = BOSS.x, by = 505;
+  ctx.save();
+  if (BOSS.facing === 'front') {
+    ctx.fillStyle = 'rgba(255,90,90,0.08)';
+    ctx.beginPath();
+    ctx.arc(bx, by - 70, 90, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  const step = BOSS.state === 'walk' ? Math.sin(GAME.time * 11) * 7 : 0;
+  ctx.fillStyle = '#20293c';
+  ctx.fillRect(bx - 26, by - 96, 20, 62 + step);
+  ctx.fillRect(bx + 6, by - 96, 20, 62 - step);
+  ctx.fillStyle = '#2b3550';
+  ctx.beginPath();
+  ctx.roundRect(bx - 38, by - 158, 76, 78, 12);
+  ctx.fill();
+  ctx.fillStyle = '#f2c9a0';
+  ctx.beginPath();
+  ctx.arc(bx, by - 182, 27, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#20293c';
+  ctx.beginPath();
+  ctx.arc(bx, by - 188, 27, Math.PI, Math.PI * 2);
+  ctx.fill();
+  ctx.fillRect(bx - 27, by - 190, 54, 8);
+  if (BOSS.facing === 'front') {
+    ctx.fillStyle = '#fff';
+    ctx.beginPath();
+    ctx.arc(bx - 10, by - 180, 5, 0, Math.PI * 2);
+    ctx.arc(bx + 10, by - 180, 5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#111';
+    ctx.beginPath();
+    ctx.arc(bx - 10, by - 180, 2.4, 0, Math.PI * 2);
+    ctx.arc(bx + 10, by - 180, 2.4, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#8a2f2f';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(bx - 17, by - 192);
+    ctx.lineTo(bx - 4, by - 187);
+    ctx.moveTo(bx + 17, by - 192);
+    ctx.lineTo(bx + 4, by - 187);
+    ctx.stroke();
+    ctx.strokeStyle = '#b05050';
+    ctx.beginPath();
+    ctx.moveTo(bx - 8, by - 168);
+    ctx.quadraticCurveTo(bx, by - 173, bx + 8, by - 168);
+    ctx.stroke();
+    ctx.fillStyle = '#ff5a5a';
+    ctx.font = 'bold 34px sans-serif';
+    ctx.fillText('!', bx, by - 232 + Math.sin(GAME.time * 8) * 4);
+  } else {
+    ctx.fillStyle = '#20293c';
+    ctx.beginPath();
+    ctx.arc(bx + BOSS.side * 8, by - 182, 27, Math.PI * 0.5, Math.PI * 1.5);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+function drawFish() {
+  const holding = PLAYER.holding && GAME.stunned <= 0;
+  const sq = holding ? Math.abs(Math.sin(PLAYER.rubPhase)) : Math.sin(GAME.time * 2) * 0.12 + 0.12;
+  const rot = holding ? Math.sin(PLAYER.rubPhase * 0.7) * 0.07 : 0;
+  const x = FISH.x, y = FISH.y;
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(rot);
+  ctx.scale(1 + sq * 0.16, 1 - sq * 0.2);
+  ctx.fillStyle = 'rgba(0,0,0,0.35)';
+  ctx.beginPath();
+  ctx.ellipse(0, 34, 52, 10, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#2f8fe0';
+  ctx.beginPath();
+  ctx.ellipse(0, 0, 46, 30, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(38, -4);
+  ctx.lineTo(66, -20);
+  ctx.lineTo(66, 20);
+  ctx.closePath();
+  ctx.fill();
+  ctx.fillStyle = '#5fb2ef';
+  ctx.beginPath();
+  ctx.ellipse(-6, 8, 30, 16, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#2f8fe0';
+  ctx.beginPath();
+  ctx.ellipse(-2, -22, 12, 8, -0.5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#fff';
+  ctx.beginPath();
+  ctx.arc(-24, -6, 7, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#12202e';
+  ctx.beginPath();
+  ctx.arc(-26, -6, 3.4, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = '#1b5c96';
+  ctx.lineWidth = 2.4;
+  ctx.beginPath();
+  ctx.arc(-22, 4, 8, 0.2, Math.PI - 0.4);
+  ctx.stroke();
+  ctx.fillStyle = 'rgba(255,255,255,0.5)';
+  ctx.beginPath();
+  ctx.ellipse(10, -14, 10, 5, -0.4, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+  ctx.textAlign = 'center';
+  ctx.fillStyle = 'rgba(143,211,255,0.75)';
+  ctx.font = '13px "PingFang SC","Microsoft YaHei",sans-serif';
+  ctx.fillText('摸我！', x, y + 62);
+}
+
+function drawHand() {
+  const ox = Math.sin(PLAYER.rubPhase) * 22;
+  const x = FISH.x - 10 + ox, y = FISH.y - 26;
+  ctx.save();
+  ctx.strokeStyle = '#f2c9a0';
+  ctx.lineWidth = 26;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(W - 40, H + 30);
+  ctx.quadraticCurveTo(x + 150, y + 150, x + 30, y + 16);
+  ctx.stroke();
+  ctx.fillStyle = '#f2c9a0';
+  ctx.beginPath();
+  ctx.arc(x, y, 22, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = '#d9a97e';
+  ctx.lineWidth = 2;
+  for (let i = -1; i <= 1; i++) {
+    ctx.beginPath();
+    ctx.moveTo(x - 12, y + i * 8);
+    ctx.quadraticCurveTo(x, y + i * 8 + 3, x + 12, y + i * 8);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawScoldBubble() {
+  if (GAME.scoldT <= 0) return;
+  const a = Math.min(1, GAME.scoldT / 0.4);
+  const bx = BOSS.x, by = 240;
+  ctx.save();
+  ctx.globalAlpha = a;
+  ctx.fillStyle = '#fff';
+  ctx.strokeStyle = '#ff5a5a';
+  ctx.lineWidth = 3;
+  ctx.font = 'bold 20px "PingFang SC","Microsoft YaHei",sans-serif';
+  const w = Math.max(150, ctx.measureText(GAME.scoldText).width + 36);
+  ctx.beginPath();
+  ctx.roundRect(bx - w / 2, by - 30, w, 48, 12);
+  ctx.fill();
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(bx - 10, by + 17);
+  ctx.lineTo(bx + 2, by + 42);
+  ctx.lineTo(bx + 12, by + 17);
+  ctx.closePath();
+  ctx.fillStyle = '#fff';
+  ctx.fill();
+  ctx.fillStyle = '#c0392b';
+  ctx.textAlign = 'center';
+  ctx.fillText(GAME.scoldText, bx, by);
+  ctx.restore();
+}
+
+function drawFloatsLayer() {
+  ctx.textAlign = 'center';
+  for (const f of FX.floats) {
+    ctx.save();
+    ctx.globalAlpha = Math.max(0, Math.min(1, f.life / 0.6));
+    ctx.fillStyle = f.color;
+    ctx.font = 'bold ' + f.size + 'px "PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.fillText(f.text, f.x, f.y);
+    ctx.restore();
+  }
+}
+
+GAME.cdPulse = 0;
+GAME.cdTier = '';
+
+function updateBoss(dt) {
+  if (GAME.scene !== 'PLAYING') return;
+  const st = currentStage();
+  BOSS.timer -= dt;
+  switch (BOSS.state) {
+    case 'walk':
+      BOSS.x += BOSS.dir * CONFIG.boss.walkSpeed * dt;
+      BOSS.side = BOSS.dir;
+      if (BOSS.x < CONFIG.bossRange.left) { BOSS.x = CONFIG.bossRange.left; BOSS.dir = 1; }
+      if (BOSS.x > CONFIG.bossRange.right) { BOSS.x = CONFIG.bossRange.right; BOSS.dir = -1; }
+      if (BOSS.timer <= 0) { BOSS.state = 'pause'; BOSS.timer = rnd(CONFIG.boss.pauseMin, CONFIG.boss.pauseMax); }
+      break;
+    case 'pause':
+      if (BOSS.timer <= 0) {
+        if (Math.random() < st.watchChance) { BOSS.state = 'turn'; BOSS.timer = CONFIG.boss.turnTime; }
+        else { BOSS.state = 'walk'; BOSS.dir = Math.random() < 0.5 ? -1 : 1; BOSS.timer = rnd(1.4, 3.0); }
+      }
+      break;
+    case 'turn':
+      if (BOSS.timer <= 0) {
+        BOSS.state = 'watch';
+        BOSS.facing = 'front';
+        BOSS.timer = rnd(st.watchMin, st.watchMax);
+        BOSS.watchElapsedHold = 0;
+        audioAlert();
+      }
+      break;
+    case 'watch':
+      if (PLAYER.holding && GAME.stunned <= 0) {
+        BOSS.watchElapsedHold += dt;
+        if (BOSS.watchElapsedHold >= CONFIG.reactionWindow) { caught(); return; }
+      } else {
+        BOSS.watchElapsedHold = 0;
+      }
+      if (BOSS.timer <= 0) { BOSS.state = 'turnback'; BOSS.timer = CONFIG.boss.turnTime; BOSS.facing = 'side'; }
+      break;
+    case 'scold':
+      if (BOSS.timer <= 0) { BOSS.state = 'turnback'; BOSS.timer = CONFIG.boss.turnTime; BOSS.facing = 'side'; }
+      break;
+    case 'turnback':
+      if (BOSS.timer <= 0) { BOSS.state = 'pause'; BOSS.timer = rnd(CONFIG.boss.pauseMin, CONFIG.boss.pauseMax); }
+      break;
+  }
+}
+
+function caught() {
+  GAME.suspicion++;
+  GAME.caughtCount++;
+  GAME.remain = Math.min(CONFIG.totalTime, GAME.remain + CONFIG.caughtPenalty);
+  GAME.lastMilestoneHit = Math.ceil(GAME.remain);
+  GAME.stunned = CONFIG.caughtStun;
+  GAME.scoldT = 2.2;
+  GAME.scoldText = CONFIG.scoldLines[Math.floor(Math.random() * CONFIG.scoldLines.length)];
+  GAME.flashT = 0.5;
+  addShake(0.55);
+  PLAYER.holding = false;
+  PLAYER.holdTime = 0;
+  BOSS.state = 'scold';
+  BOSS.timer = 2.2;
+  audioCaught();
+}
+
+function timeColor(r) {
+  if (r >= 512) return '#7CFC9A';
+  if (r >= 256) return '#ffd76a';
+  if (r >= 64) return '#ffa14e';
+  return '#ff5a5a';
+}
+
+function drawHUD() {
+  const r = Math.ceil(GAME.remain);
+  const tier = timeColor(r);
+  if (tier !== GAME.cdTier) { GAME.cdTier = tier; GAME.cdPulse = 1; }
+  const pulse = 1 + GAME.cdPulse * 0.18;
+  const cx = W / 2;
+
+  ctx.fillStyle = 'rgba(10,14,22,0.72)';
+  ctx.beginPath();
+  ctx.roundRect(cx - 190, 18, 380, 96, 14);
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(63,167,255,0.35)';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = 'rgba(143,211,255,0.8)';
+  ctx.font = '15px "PingFang SC","Microsoft YaHei",sans-serif';
+  ctx.fillText('距离下班还有', cx, 38);
+  ctx.save();
+  ctx.translate(cx, 66);
+  ctx.scale(pulse, pulse);
+  ctx.fillStyle = tier;
+  ctx.font = 'bold 46px monospace';
+  ctx.fillText(String(r), 0, 0);
+  ctx.restore();
+  ctx.fillStyle = 'rgba(143,211,255,0.6)';
+  ctx.font = '13px "PingFang SC","Microsoft YaHei",sans-serif';
+  ctx.fillText('秒 · 摸鱼加速 ' + currentStage().label, cx, 100);
+
+  ctx.fillStyle = 'rgba(143,211,255,0.85)';
+  ctx.font = '14px "PingFang SC","Microsoft YaHei",sans-serif';
+  ctx.textAlign = 'left';
+  ctx.fillText('怀疑度', 30, 34);
+  for (let i = 0; i < CONFIG.maxSuspicion; i++) {
+    ctx.beginPath();
+    ctx.arc(92 + i * 26, 34, 9, 0, Math.PI * 2);
+    if (i < GAME.suspicion) { ctx.fillStyle = '#ff5a5a'; ctx.fill(); }
+    ctx.strokeStyle = i < GAME.suspicion ? '#ff5a5a' : 'rgba(143,211,255,0.4)';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }
+
+  const bx = 30, by = 58;
+  ctx.fillStyle = 'rgba(143,211,255,0.85)';
+  ctx.fillText('摸鱼加成', bx, by);
+  const jx = PLAYER.holding ? rnd(-2, 2) : 0;
+  ctx.fillStyle = 'rgba(20,28,44,0.9)';
+  ctx.fillRect(bx + jx, by + 8, 260, 14);
+  ctx.fillStyle = '#3fa7ff';
+  ctx.fillRect(bx + jx, by + 8, Math.min(260, (GAME.bonus / CONFIG.totalTime) * 260), 14);
+  ctx.strokeStyle = 'rgba(63,167,255,0.5)';
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(bx + jx, by + 8, 260, 14);
+
+  const mw = 96, mh = 36;
+  const mx = W - mw - 20, my = 20;
+  UI.muteRect = { x: mx, y: my, w: mw, h: mh };
+  ctx.fillStyle = 'rgba(20,28,44,0.9)';
+  ctx.beginPath();
+  ctx.roundRect(mx, my, mw, mh, 10);
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(63,167,255,0.4)';
+  ctx.stroke();
+  ctx.fillStyle = audioMuted ? '#8a97ad' : '#8fd3ff';
+  ctx.font = '15px "PingFang SC","Microsoft YaHei",sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText(audioMuted ? '♪ 关' : '♪ 开', mx + mw / 2, my + mh / 2 + 1);
+
+  if (GAME.milestoneToastT > 0 && GAME.scene === 'PLAYING') {
+    ctx.save();
+    ctx.globalAlpha = Math.min(1, GAME.milestoneToastT / 0.5);
+    ctx.fillStyle = timeColor(GAME.remain);
+    ctx.font = 'bold 26px "PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(GAME.milestoneToastText, cx, 150);
+    ctx.restore();
+  }
+
+  if (GAME.remain <= CONFIG.stage3Edge && GAME.scene === 'PLAYING') {
+    const a = 0.22 + 0.18 * Math.sin(GAME.time * 6);
+    ctx.save();
+    ctx.strokeStyle = 'rgba(255,90,90,' + a.toFixed(3) + ')';
+    ctx.lineWidth = 14;
+    ctx.strokeRect(7, 7, W - 14, H - 14);
+    ctx.restore();
+  }
+
+  if (GAME.flashT > 0) {
+    ctx.fillStyle = 'rgba(255,60,60,' + (GAME.flashT / 0.5 * 0.35).toFixed(3) + ')';
+    ctx.fillRect(0, 0, W, H);
+  }
+}
+
+function drawButton(rect, text, color) {
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.roundRect(rect.x, rect.y, rect.w, rect.h, 14);
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  ctx.fillStyle = '#08101c';
+  ctx.font = 'bold 22px "PingFang SC","Microsoft YaHei",sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, rect.x + rect.w / 2, rect.y + rect.h / 2 + 1);
+}
+
+function calcRating() {
+  const c = GAME.caughtCount;
+  if (c <= CONFIG.rating.S && GAME.bonus >= CONFIG.ratingBonus.S) return 'S';
+  if (c <= CONFIG.rating.A && GAME.bonus >= CONFIG.ratingBonus.A) return 'A';
+  if (c <= CONFIG.rating.B) return 'B';
+  return 'C';
+}
+
+const RATING_COLOR = { S: '#ffd76a', A: '#7CFC9A', B: '#8fd3ff', C: '#ff9a6a' };
+
+function drawFireworks() {
+  for (const p of FX.fireworks) {
+    ctx.save();
+    ctx.globalAlpha = Math.max(0, Math.min(1, p.life / 0.5));
+    ctx.fillStyle = p.color;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+function spawnFirework(x, y) {
+  const hue = ['#ff5a5a', '#ffd76a', '#7CFC9A', '#8fd3ff', '#d78cff'][Math.floor(rnd(0, 5))];
+  const n = 36;
+  for (let i = 0; i < n; i++) {
+    const ang = (i / n) * Math.PI * 2 + rnd(-0.1, 0.1);
+    const sp = rnd(70, 250);
+    FX.fireworks.push({
+      x, y,
+      vx: Math.cos(ang) * sp,
+      vy: Math.sin(ang) * sp - 40,
+      life: rnd(0.8, 1.5),
+      size: rnd(2, 4.5),
+      color: Math.random() < 0.8 ? hue : '#ffffff',
+    });
+  }
+  audioBoom();
+}
+
+function drawOverlays(dt) {
+  if (GAME.scene === 'TITLE') {
+    ctx.fillStyle = 'rgba(8,12,20,0.78)';
+    ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#3fa7ff';
+    ctx.font = 'bold 22px "PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.fillText('—— 1024 程序员节 · 摸鱼特别版 ——', W / 2, 218);
+    ctx.fillStyle = '#8fd3ff';
+    ctx.font = 'bold 72px "PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.fillText('还有1024秒下班', W / 2, 300);
+    ctx.fillStyle = 'rgba(143,211,255,0.85)';
+    ctx.font = '20px "PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.fillText('按住桌上的蓝色小鱼摸鱼，倒计时加速减少', W / 2, 392);
+    ctx.fillText('Boss 回头看你就立刻住手！反应时间只有 0.5 秒', W / 2, 428);
+    ctx.fillText('被抓 3 次 → 今晚加班；坚持到 0 秒 → 下班成功！', W / 2, 464);
+    const rect = { x: W / 2 - 130, y: 540, w: 260, h: 64 };
+    UI.startRect = rect;
+    drawButton(rect, '开始摸鱼', '#3fa7ff');
+    ctx.fillStyle = 'rgba(143,211,255,0.5)';
+    ctx.font = '14px monospace';
+    ctx.fillText('鼠标 / 触摸 / 空格键 均可摸鱼', W / 2, 646);
+  } else if (GAME.scene === 'WIN') {
+    ctx.fillStyle = 'rgba(8,12,20,0.45)';
+    ctx.fillRect(0, 0, W, H);
+    drawFireworks();
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#7CFC9A';
+    ctx.font = 'bold 64px "PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.fillText('下班成功！', W / 2, 250);
+    ctx.fillStyle = '#8fd3ff';
+    ctx.font = '24px "PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.fillText('1024 程序员节快乐！', W / 2, 310);
+    ctx.fillStyle = 'rgba(216,230,245,0.9)';
+    ctx.font = '19px "PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.fillText('摸鱼加成：节省 ' + Math.round(GAME.bonus) + ' 秒', W / 2, 386);
+    ctx.fillText('被抓次数：' + GAME.caughtCount + ' 次', W / 2, 420);
+    const rating = calcRating();
+    ctx.fillStyle = RATING_COLOR[rating];
+    ctx.font = 'bold 58px monospace';
+    ctx.fillText('评级 ' + rating, W / 2, 486);
+    const rect = { x: W / 2 - 120, y: 560, w: 240, h: 60 };
+    UI.againRect = rect;
+    drawButton(rect, '再来一局', '#7CFC9A');
+  } else if (GAME.scene === 'LOSE') {
+    ctx.fillStyle = 'rgba(20,8,10,0.82)';
+    ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#ff5a5a';
+    ctx.font = 'bold 60px "PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.fillText('被抓包了！', W / 2, 280);
+    ctx.fillStyle = 'rgba(216,230,245,0.9)';
+    ctx.font = '22px "PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.fillText('怀疑度爆表，今晚加班到天亮……', W / 2, 350);
+    ctx.font = '17px "PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.fillStyle = 'rgba(143,211,255,0.7)';
+    ctx.fillText('坚持了 ' + Math.ceil(GAME.remain) + ' 秒，摸鱼加成 ' + Math.round(GAME.bonus) + ' 秒', W / 2, 400);
+    const rect = { x: W / 2 - 120, y: 500, w: 240, h: 60 };
+    UI.retryRect = rect;
+    drawButton(rect, '重新开始', '#ff5a5a');
+  }
+}
+
+let audioCtx = null;
+let audioMuted = false;
+let lastRubT = 0;
+
+function ensureAudio() {
+  if (!audioCtx) {
+    try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { audioCtx = null; }
+  }
+  if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+}
+
+function tone(freq, dur, type, vol, slideTo, delay) {
+  if (audioMuted || !audioCtx) return;
+  const t0 = audioCtx.currentTime + (delay || 0);
+  const o = audioCtx.createOscillator();
+  const g = audioCtx.createGain();
+  o.type = type || 'sine';
+  o.frequency.setValueAtTime(freq, t0);
+  if (slideTo) o.frequency.exponentialRampToValueAtTime(Math.max(30, slideTo), t0 + dur);
+  g.gain.setValueAtTime(vol, t0);
+  g.gain.exponentialRampToValueAtTime(0.001, t0 + dur);
+  o.connect(g).connect(audioCtx.destination);
+  o.start(t0);
+  o.stop(t0 + dur + 0.02);
+}
+
+function noiseBurst(dur, vol) {
+  if (audioMuted || !audioCtx) return;
+  const n = Math.floor(audioCtx.sampleRate * dur);
+  const buf = audioCtx.createBuffer(1, n, audioCtx.sampleRate);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / n);
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  const g = audioCtx.createGain();
+  g.gain.value = vol;
+  src.connect(g).connect(audioCtx.destination);
+  src.start();
+}
+
+function audioStart() { ensureAudio(); }
+
+function audioRub() {
+  if (audioMuted || !audioCtx) return;
+  const now = audioCtx.currentTime;
+  if (now - lastRubT < 0.13) return;
+  lastRubT = now;
+  tone(rnd(280, 520), 0.09, 'square', 0.035, rnd(160, 240));
+}
+
+function audioAlert() {
+  tone(620, 0.11, 'sine', 0.14);
+  tone(880, 0.14, 'sine', 0.14, 0, 0.11);
+}
+
+function audioCaught() {
+  tone(220, 0.5, 'sawtooth', 0.18, 70);
+  noiseBurst(0.3, 0.12);
+}
+
+function audioPop() {
+  tone(560, 0.12, 'sine', 0.12, 920);
+}
+
+function audioBoom() {
+  noiseBurst(0.5, 0.16);
+  tone(rnd(90, 140), 0.4, 'sine', 0.1, 50);
+}
+
+function audioWin() {
+  const seq = [523, 659, 784, 1046, 1318];
+  seq.forEach((f, i) => tone(f, 0.35, 'triangle', 0.14, 0, i * 0.16));
+}
+
+function inRect(p, r) {
+  return r && p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h;
+}
+
+function fishHit(p) {
+  const dx = p.x - FISH.x, dy = p.y - FISH.y;
+  return dx * dx + dy * dy < 95 * 95;
+}
+
+canvas.addEventListener('pointerdown', (e) => {
+  e.preventDefault();
+  ensureAudio();
+  const p = toGameXY(e.clientX, e.clientY);
+  if (inRect(p, UI.muteRect)) { audioMuted = !audioMuted; return; }
+  if (GAME.scene === 'TITLE') { if (inRect(p, UI.startRect)) startGame(); return; }
+  if (GAME.scene === 'WIN') { if (inRect(p, UI.againRect)) startGame(); return; }
+  if (GAME.scene === 'LOSE') { if (inRect(p, UI.retryRect)) startGame(); return; }
+  if (GAME.scene === 'PLAYING' && fishHit(p)) { PLAYER.holding = true; }
+});
+
+window.addEventListener('pointerup', () => { PLAYER.holding = false; });
+window.addEventListener('pointercancel', () => { PLAYER.holding = false; });
+canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
+window.addEventListener('keydown', (e) => {
+  if (e.repeat) return;
+  if (e.code === 'Space' || e.code === 'Enter') {
+    e.preventDefault();
+    ensureAudio();
+    if (GAME.scene === 'TITLE' || GAME.scene === 'WIN' || GAME.scene === 'LOSE') { startGame(); return; }
+    if (GAME.scene === 'PLAYING') PLAYER.holding = true;
+  }
+  if (e.code === 'KeyM') audioMuted = !audioMuted;
+});
+
+window.addEventListener('keyup', (e) => {
+  if (e.code === 'Space') { e.preventDefault(); PLAYER.holding = false; }
+});
+
+function rnd(a, b) { return a + Math.random() * (b - a); }
+
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
